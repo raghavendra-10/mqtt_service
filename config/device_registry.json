@@ -1,0 +1,25 @@
+{
+  "_comment": "Maps WT410M gateway IMEI → plant/inverter. For testing: TEST_GATEWAY is a catch-all that matches any IMEI not explicitly listed. Updated to include all 3 slaves from modbus_simulator/inverter_sim.py.",
+
+  "TEST_GATEWAY": {
+    "_name": "Test - Laptop Simulator (3 slaves: inverter / meter / load)",
+    "1": {
+      "plant_id": "test-plant-001",
+      "inverter_id": "test-inverter-001",
+      "inverter_sn": "SIM-500-001",
+      "type": "inverter"
+    },
+    "2": {
+      "plant_id": "test-plant-001",
+      "inverter_id": "test-meter-001",
+      "inverter_sn": "SIM-METER-001",
+      "type": "meter"
+    },
+    "3": {
+      "plant_id": "test-plant-001",
+      "inverter_id": "test-load-001",
+      "inverter_sn": "SIM-LOAD-001",
+      "type": "load"
+    }
+  }
+}

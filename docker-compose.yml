@@ -1,0 +1,14 @@
+services:
+  # MQTT Broker - Mosquitto
+  # Your WT410M gateway publishes here. This service subscribes.
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: goodenergies_mosquitto
+    ports:
+      - "1883:1883"    # MQTT default
+      - "9001:9001"    # WebSocket (optional)
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    restart: unless-stopped

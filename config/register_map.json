@@ -1,0 +1,48 @@
+{
+  "_comment": "Maps Modbus register addresses to production field names. Updated to match modbus_simulator/inverter_sim.py (3 slaves). Addresses are 0-based (zero_mode=True in pymodbus). The parser tries keys in this priority: '{IMEI}:{slave_id}' → '*:{slave_id}' → 'default'.",
+
+  "_slave_layout": {
+    "1": "inverter (energy / freq / current / fault)",
+    "2": "meter (3-phase currents + 32-bit meterPower & loadPower)",
+    "3": "load / 3-phase voltages & currents"
+  },
+
+  "*:1": {
+    "_comment_slave1": "Inverter — slave1_data() in inverter_sim.py",
+    "5002": {"field": "dailyPowerYield", "scale": 0.1,  "type": "float"},
+    "5007": {"field": "activePower",     "scale": 0.1,  "type": "float"},
+    "5016": {"field": "frequency",       "scale": 0.01, "type": "float"},
+    "5021": {"field": "rCurrent",        "scale": 0.1,  "type": "float"},
+    "5034": {"field": "faultId",         "scale": 1,    "type": "int"}
+  },
+
+  "*:2": {
+    "_comment_slave2": "Meter — slave2_data(). 5083+5084 = meterPower (uint32, low+high), 5091+5092 = loadPower (uint32, low+high). Parser does NOT auto-combine yet — see CHANGES.md.",
+    "5022": {"field": "rCurrent",        "scale": 0.1,  "type": "float"},
+    "5023": {"field": "sCurrent",        "scale": 0.1,  "type": "float"},
+    "5024": {"field": "tCurrent",        "scale": 0.1,  "type": "float"},
+    "5083": {"field": "meterPowerLow",   "scale": 1,    "type": "int"},
+    "5084": {"field": "meterPowerHigh",  "scale": 1,    "type": "int"},
+    "5091": {"field": "loadPowerLow",    "scale": 1,    "type": "int"},
+    "5092": {"field": "loadPowerHigh",   "scale": 1,    "type": "int"}
+  },
+
+  "*:3": {
+    "_comment_slave3": "3-phase voltages & currents — slave3_data()",
+    "5011": {"field": "phaseA_tick",     "scale": 0.1,  "type": "float"},
+    "5012": {"field": "phaseA_current",  "scale": 0.1,  "type": "float"},
+    "5013": {"field": "phaseA_voltage",  "scale": 0.1,  "type": "float"},
+    "5014": {"field": "phaseB_current",  "scale": 0.1,  "type": "float"},
+    "5015": {"field": "phaseB_voltage",  "scale": 0.1,  "type": "float"},
+    "5016": {"field": "phaseC_current",  "scale": 0.1,  "type": "float"}
+  },
+
+  "default": {
+    "_comment_default": "Legacy fallback. Kept for backward compatibility with old simulator (1-based addresses).",
+    "5003": {"field": "dailyPowerYield", "scale": 0.1,  "type": "float"},
+    "5008": {"field": "activePower",     "scale": 0.1,  "type": "float"},
+    "5017": {"field": "frequency",       "scale": 0.01, "type": "float"},
+    "5022": {"field": "rCurrent",        "scale": 0.1,  "type": "float"},
+    "5035": {"field": "faultId",         "scale": 1,    "type": "int"}
+  }
+}
