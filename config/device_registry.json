@@ -1,5 +1,57 @@
 {
-  "_comment": "Maps WT410M gateway IMEI → plant/inverter. For testing: TEST_GATEWAY is a catch-all that matches any IMEI not explicitly listed. Updated to include all 3 slaves from modbus_simulator/inverter_sim.py.",
+  "_comment": "Maps WT410M gateway IMEI → plant/inverter. SID = Modbus slave ID from datalogger.",
+
+  "860710086613836": {
+    "_name": "Sivakasi Plant - Production Gateway",
+    "1": {
+      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
+      "inverter_id": "42de11b3-f6ea-4346-9392-222251574d17",
+      "inverter_sn": "1",
+      "type": "inverter"
+    },
+    "7": {
+      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
+      "inverter_id": "f71493d2-ca0d-478a-bb07-6b258f6c8658",
+      "inverter_sn": "7",
+      "type": "inverter"
+    },
+    "8": {
+      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
+      "inverter_id": "1d83b267-2b9b-4f8a-8faa-57ced4c40a5b",
+      "inverter_sn": "8",
+      "type": "inverter"
+    },
+    "9": {
+      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
+      "inverter_id": "4b97e3d2-dd1d-456f-9e07-5d85eedafe61",
+      "inverter_sn": "9",
+      "type": "inverter"
+    },
+    "11": {
+      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
+      "inverter_id": "b4bb3b70-cad5-4adc-8f9b-bf52d8eee942",
+      "inverter_sn": "11",
+      "type": "inverter"
+    },
+    "12": {
+      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
+      "inverter_id": "1050deec-f338-4d28-a632-5f91f3feac92",
+      "inverter_sn": "12",
+      "type": "inverter"
+    },
+    "13": {
+      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
+      "inverter_id": "edbd3f28-67cf-47e2-b8a1-bf2065f6b6bf",
+      "inverter_sn": "13",
+      "type": "inverter"
+    },
+    "16": {
+      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
+      "inverter_id": "5c151f36-ddb9-416b-af58-a87d543ac040",
+      "inverter_sn": "16",
+      "type": "inverter"
+    }
+  },
 
   "TEST_GATEWAY": {
     "_name": "Test - Laptop Simulator (3 slaves: inverter / meter / load)",

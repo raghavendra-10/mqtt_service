@@ -18,9 +18,34 @@ from .db_writer import (
     save_weather_reading,
     save_inverter_reading,
     save_mqtt_message,
+    save_inverter_log,
+    save_production_reading,
+    fetch_and_save_weather,
 )
 
 logger = logging.getLogger("event_handler")
+
+# Load device registry for IMEI:sid → inverter mapping
+def _load_device_registry() -> Dict:
+    import os
+    registry_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "config", "device_registry.json"
+    )
+    try:
+        with open(registry_path, "r") as f:
+            import json as _json
+            return _json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load device_registry.json: {e}")
+        return {}
+
+_DEVICE_REGISTRY = _load_device_registry()
+
+# Plant coordinates for weather fetching
+_PLANT_COORDS = {
+    "4e830dca-ee75-46eb-9799-8ce5cbb573ce": {"lat": 9.4729, "lon": 77.7047},  # Sivakasi
+}
 
 
 class EventHandler:
@@ -43,6 +68,9 @@ class EventHandler:
             "simulator_messages": 0,
             "errors": 0,
         }
+        # Track flushed data ranges for recalculation
+        self._flush_ranges = {}  # inverter_id -> (min_ts, max_ts)
+        self._flush_last_trigger = None
 
     def _get_loop(self):
         if self.loop is None or self.loop.is_closed():
@@ -52,15 +80,77 @@ class EventHandler:
     def _run_async(self, coro):
         return self._get_loop().run_until_complete(coro)
 
+    def _track_flush(self, inverter_id: str, reading_ts):
+        """Track flushed data timestamp range per inverter."""
+        if inverter_id not in self._flush_ranges:
+            self._flush_ranges[inverter_id] = (reading_ts, reading_ts)
+        else:
+            min_ts, max_ts = self._flush_ranges[inverter_id]
+            self._flush_ranges[inverter_id] = (min(min_ts, reading_ts), max(max_ts, reading_ts))
+
+        # Trigger recalculation every 60 seconds (batch the flushes)
+        from datetime import datetime
+        now = datetime.utcnow()
+        if self._flush_last_trigger is None or (now - self._flush_last_trigger).total_seconds() > 60:
+            self._flush_last_trigger = now
+            self._trigger_recalculation()
+
+    def _trigger_recalculation(self):
+        """Delete and recalculate yield/PR for flushed data ranges."""
+        if not self._flush_ranges:
+            return
+
+        from .db_writer import get_pool
+        import json
+
+        async def _recalc():
+            pool = await get_pool()
+            for inv_id, (min_ts, max_ts) in self._flush_ranges.items():
+                min_str = min_ts.strftime('%Y-%m-%d %H:%M:%S')
+                max_str = max_ts.strftime('%Y-%m-%d %H:%M:%S')
+
+                # Delete old yield curve and PR for this range
+                async with pool.acquire() as conn:
+                    del_yc = await conn.execute(
+                        'DELETE FROM inverter_yield_curve WHERE "inverterId" = $1 AND timestamp >= $2::timestamp AND timestamp <= $3::timestamp',
+                        inv_id, min_str, max_str
+                    )
+                    del_pr = await conn.execute(
+                        'DELETE FROM inverter_pr WHERE "inverterId" = $1 AND timestamp >= $2::timestamp AND timestamp <= $3::timestamp',
+                        inv_id, min_str, max_str
+                    )
+                    # Send PG NOTIFY to trigger event listener recalculation
+                    await conn.execute(
+                        "SELECT pg_notify('new_inverter_reading', $1)",
+                        json.dumps({"inverter_id": inv_id, "timestamp": max_str, "flush_recalc": True})
+                    )
+
+                logger.info(
+                    f"[FLUSH-RECALC] inv={inv_id[:8]} range={min_str} to {max_str} — deleted old calcs, triggered recalc"
+                )
+
+            self._flush_ranges.clear()
+
+        try:
+            self._run_async(_recalc())
+        except Exception as e:
+            logger.error(f"Flush recalculation failed: {e}")
+
     def handle_message(self, topic: str, payload: bytes) -> bool:
         """Main entry point - dispatches to gateway or simulator handler."""
         try:
+            # WT410M raw modbus log on iot1/* or iot2/* (topic shape may vary).
+            # Routes each modbus entry to inverter_full_log or inverter_realtime_log
+            # based on whether "Device type code" is present.
+            if topic.startswith(("iot1/", "iot2/")):
+                return self._handle_modbus_log(topic, payload)
+
             # WT410M gateway message
             if self.gateway_parser and self.gateway_parser.is_gateway_message(topic):
                 return self._handle_gateway_message(topic, payload)
 
             # Simulator / direct JSON
-            data = json.loads(payload.decode("utf-8"))
+            data = json.loads(payload.decode("latin-1"), strict=False)
             message_type = self._get_message_type(topic)
 
             if message_type == "weather":
@@ -79,6 +169,148 @@ class EventHandler:
             logger.error(f"Error handling message from {topic}: {e}", exc_info=True)
             self.stats["errors"] += 1
             return False
+
+    # ---- WT410M raw modbus log (two-table split) ----
+
+    def _handle_modbus_log(self, topic: str, payload: bytes) -> bool:
+        """
+        Save WT410M payloads to inverter_full_log / inverter_realtime_log.
+
+        Expected payload shape:
+            {"data": {"imei": "...", "uid": 1, "dtm": "20260506221920",
+                      "seq": 495, "msg": "log",
+                      "modbus": [{"sid": 1, "stat": 0, "rcnt": N, ...fields...}]}}
+
+        Each modbus entry with stat==0 is saved. Entries containing
+        "Device type code" go to inverter_full_log; others to inverter_realtime_log.
+        """
+        try:
+            # Gateway may embed raw binary in "reserved" fields; keep only
+            # printable ASCII + common whitespace so JSON parsing succeeds.
+            clean = bytes(b for b in payload if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D))
+            text = clean.decode("ascii")
+
+            # Log full cleaned payload from datalogger
+            logger.info(f"[RAW] {text[:2000]}")
+
+            # Fix gateway firmware bugs before JSON parsing
+            import re
+            # 1. Strip "reserved" fields (reserved, reserved1, reserved2, reserved3, etc.)
+            #    These are Modbus skip-word registers that contain binary garbage from
+            #    the WT410M data logger. The logger reads continuous register blocks and
+            #    includes reserved/unused registers in the payload. Their values are
+            #    meaningless and often contain control characters that break JSON parsing.
+            text = re.sub(r'"reserved\d*"\s*:\s*"[^"]*"', '"_reserved":""', text)
+
+            # 2. Try parsing — use strict=False to tolerate any remaining control chars
+            try:
+                data = json.loads(text, strict=False)
+            except json.JSONDecodeError:
+                # 3. Fix truncated fields: gateway drops field names,
+                #    leaving ":value,value" instead of ":value,"fieldname":value"
+                #    Pattern: number followed by comma and number WITHOUT a quoted key after
+                #    e.g. "String 23 current":0,0 } → "String 23 current":0 }
+                text = re.sub(r',\s*(-?\d+)\s*\}', r' }', text)
+                # Also handle multiple orphaned values: :0,0,0 }
+                text = re.sub(r',\s*(-?\d+)\s*\}', r' }', text)
+                try:
+                    data = json.loads(text, strict=False)
+                    logger.info(f"[FIX] Recovered malformed payload after cleanup")
+                except json.JSONDecodeError as e2:
+                    raise e2
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+            if isinstance(e, json.JSONDecodeError):
+                p = e.pos
+                txt = clean.decode("ascii", errors="replace")
+                logger.error(f"Bad payload on {topic}: {e} | around pos {p}: ...{txt[max(0,p-30):p+15]}...")
+            else:
+                logger.error(f"Bad payload on {topic}: {e}")
+            self.stats["errors"] += 1
+            return False
+
+        inner = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(inner, dict) or "modbus" not in inner:
+            logger.warning(f"Payload on {topic} has no data.modbus[]; skipping")
+            return False
+
+        imei = inner.get("imei", "")
+        uid = inner.get("uid")
+        dtm = inner.get("dtm")
+        seq = inner.get("seq")
+        modbus = inner.get("modbus", [])
+
+        any_saved = False
+        for entry in modbus:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("stat", -1) != 0:
+                continue
+
+            sid = entry.get("sid")
+            kind = "full" if "Device type code" in entry else "realtime"
+
+            rid = self._run_async(save_inverter_log(
+                kind=kind,
+                gateway_imei=imei,
+                topic=topic,
+                uid=uid,
+                sid=sid,
+                dtm=dtm,
+                seq=seq,
+                data=entry,
+            ))
+            if rid:
+                any_saved = True
+                self.stats["gateway_messages"] += 1
+                logger.info(
+                    f"[{kind.upper()}] imei={imei} sid={sid} seq={seq} "
+                    f"rcnt={entry.get('rcnt')} -> id={rid}"
+                )
+
+                # Also write to production inverter_readings table
+                device = _DEVICE_REGISTRY.get(imei, {}).get(str(sid))
+                if device and device.get("type") == "inverter":
+                    prod_id = self._run_async(save_production_reading(
+                        inverter_id=device["inverter_id"],
+                        inverter_sn=device["inverter_sn"],
+                        dtm=dtm,
+                        data=entry,
+                        sid=sid,
+                    ))
+                    if prod_id:
+                        self.stats["inverter_processed"] += 1
+                        logger.info(
+                            f"[PROD] sid={sid} sn={device['inverter_sn']} -> id={prod_id}"
+                        )
+
+                        # Event-driven weather: fetch from Open-Meteo, save with inverter timestamp
+                        plant_coords = _PLANT_COORDS.get(device["plant_id"])
+                        if plant_coords:
+                            from .db_writer import _parse_dtm_as_utc
+                            reading_ts = _parse_dtm_as_utc(dtm)
+                            self._run_async(fetch_and_save_weather(
+                                plant_id=device["plant_id"],
+                                lat=plant_coords["lat"],
+                                lon=plant_coords["lon"],
+                                reading_ts=reading_ts,
+                            ))
+
+                        # Detect flushed/buffered data (dtm > 5 min behind current time)
+                        # Flag for recalculation so yield/PR gets computed for old timestamps
+                        if reading_ts:
+                            from datetime import datetime as _dt
+                            delay_sec = (_dt.utcnow() - reading_ts).total_seconds()
+                            if delay_sec > 300:  # More than 5 min old = flushed data
+                                self._track_flush(device["inverter_id"], reading_ts)
+                                logger.info(
+                                    f"[FLUSH] sid={sid} dtm={dtm} delay={int(delay_sec)}s — queued for recalculation"
+                                )
+                    else:
+                        self.stats["errors"] += 1
+            else:
+                self.stats["errors"] += 1
+
+        return any_saved
 
     # ---- WT410M Gateway ----
 

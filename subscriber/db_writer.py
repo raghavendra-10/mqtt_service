@@ -180,3 +180,305 @@ async def save_weather_reading(data: Dict) -> Optional[str]:
 async def save_mqtt_message(topic: str, payload: Dict, processed: bool = False, error: str = None) -> Optional[str]:
     """Skip message logging in test mode."""
     return None
+
+
+def _parse_dtm_as_utc(dtm: str) -> Optional[datetime]:
+    """Parse gateway dtm (IST) → naive UTC datetime for inverter_readings."""
+    if not dtm or len(str(dtm)) < 14:
+        return None
+    try:
+        dt = datetime.strptime(str(dtm)[:14], "%Y%m%d%H%M%S")
+        dt_ist = IST.localize(dt)       # Gateway sends IST
+        dt_utc = dt_ist.astimezone(pytz.utc)
+        return dt_utc.replace(tzinfo=None)  # Naive UTC for storage
+    except ValueError:
+        return None
+
+
+def _parse_dtm(dtm: str) -> Optional[datetime]:
+    if not dtm or len(str(dtm)) < 14:
+        return None
+    try:
+        dt = datetime.strptime(str(dtm)[:14], "%Y%m%d%H%M%S")
+        dt = pytz.utc.localize(dt)
+        return dt.astimezone(IST)
+    except ValueError:
+        return None
+
+
+async def save_production_reading(inverter_id: str, inverter_sn: str,
+                                  dtm: str, data: Dict, sid: int = None) -> Optional[str]:
+    """
+    Write a scaled reading to the production inverter_readings table.
+
+    Maps raw WT410M gateway JSONB fields to production columns with scaling.
+    The gateway outputs values in engineering units (V, A, W, kWh, Hz).
+    Power values (W) are converted to kW for storage.
+    """
+    pool = await get_pool()
+    # Gateway sends dtm in IST. Parse as IST, convert to UTC (naive) for storage.
+    ts = _parse_dtm_as_utc(dtm)
+    if ts is None:
+        ts = datetime.utcnow()
+
+    # Helper to safely extract and scale a numeric value.
+    # Tries new (abbreviated) key first, falls back to old (verbose) key.
+    def val(new_key, scale=1.0, old_key=None):
+        v = data.get(new_key)
+        if v is None and old_key:
+            v = data.get(old_key)
+        if v is None:
+            return None
+        try:
+            return float(v) * scale
+        except (ValueError, TypeError):
+            return None
+
+    # Map raw JSONB → production columns
+    # Supports both new abbreviated labels (DlyPowYield) and old verbose labels (Daily power yields)
+    # Power: gateway outputs in Watts → store in kW (÷1000)
+    # Voltage/Current/Freq/PF: already in engineering units
+    # Energy: already in kWh
+    reading = {
+        "activePower": val("TotActPow", 0.001, "Total active power"),       # W → kW
+        "dailyPowerYield": val("DlyPowYield", 1.0, "Daily power yields"),   # kWh
+        "totalPowerYield": val("TotPowYield", 1.0, "Total power yields"),   # kWh
+        "totalDcPower": val("TotDCPow", 0.001, "Total DC power"),           # W → kW
+        "totalActivePower": val("TotActPow", 0.001, "Total active power"),  # W → kW
+        "reactivePowerKvar": val("TotReaPow", 0.001, "Total reactive pow"), # W → kVAR
+        "frequency": val("Gridfreq", 1.0, "Grid frequency"),               # Hz
+        "powerFactor": val("PowFactor", 1.0, "Power factor"),               # 0-1
+        "faultId": int(data.get("FalCode", data.get("Fault Code", 0)) or 0),
+        # AC voltages (V)
+        "ryAcVolt": val("ABlineVol", 1.0, "A-B line voltage/p"),
+        "ybAcVolt": val("BClineVol", 1.0, "B-C line Voltage/p"),
+        "brAcVolt": val("CAlineVol", 1.0, "C-A line Voltage/p"),
+        # AC currents (A)
+        "rCurrent": val("PhaseACur", 1.0, "Phase A current"),
+        "yCurrent": val("PhaseBCur", 1.0, "Phase B current"),
+        "bCurrent": val("PhaseCCur", 1.0, "Phase C current"),
+        # Internal temperature (°C)
+        "internalTemperature": val("IntTemp", 1.0, "Internal temperatu"),
+        # Work state (0/33280=Generating, 5120=Standby, 4608=Starting, 5632=Shutting down)
+        "workState": int(data.get("Workstate", data.get("Work state", 0)) or 0),
+    }
+
+    # MPPT voltage and current (up to 12 for SG320HX)
+    for i in range(1, 21):
+        v = val(f"MPPT{i}Vol", 1.0, f"MPPT {i} voltage")
+        c = val(f"MPPT{i}Cur", 1.0, f"MPPT {i} current")
+        if v is not None:
+            reading[f"mppt{i}Voltage"] = v
+        if c is not None:
+            reading[f"mppt{i}Current"] = c
+
+    # String currents (up to 24 for SG320HX)
+    for i in range(1, 41):
+        c = val(f"Str{i}Cur", 1.0, f"String {i} current")
+        if c is not None:
+            reading[f"pv{i}Current"] = c
+
+    # Build dynamic INSERT — only include non-None fields
+    cols = ['"inverterId"', '"inverterSn"', '"timestamp"']
+    vals = [inverter_id, inverter_sn, ts]
+
+    if sid is not None:
+        cols.append('sid')
+        vals.append(sid)
+
+    for col, v in reading.items():
+        if v is not None:
+            cols.append(f'"{col}"')
+            vals.append(v)
+
+    placeholders = ", ".join(f"${i+1}" for i in range(len(vals)))
+    col_list = ", ".join(cols)
+
+    sql = f"""
+        INSERT INTO inverter_readings (id, {col_list})
+        VALUES (gen_random_uuid(), {placeholders})
+        RETURNING id
+    """
+
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(sql, *vals)
+        return str(row["id"])
+    except Exception as e:
+        logger.error(f"Production write failed: {e}")
+        return None
+
+
+## ---- Weather: Open-Meteo integration (event-driven) ----
+
+_last_weather_cycle: Optional[str] = None  # Last dtm cycle we fetched weather for
+_cached_weather: Optional[dict] = None     # Cached Open-Meteo response (reused within 15 min)
+_cache_time: Optional[datetime] = None
+
+
+async def fetch_and_save_weather(plant_id: str, lat: float, lon: float,
+                                  reading_ts: Optional[datetime] = None) -> Optional[str]:
+    """
+    Fetch current weather from Open-Meteo and save to weather_readings.
+    Called once per inverter reading cycle (~1 min).
+    Caches the API response for 15 min (Open-Meteo's resolution) but saves
+    a row for EVERY cycle so calculators always find matching weather data.
+    """
+    global _last_weather_cycle, _cached_weather, _cache_time
+
+    now = datetime.utcnow()
+
+    # Use inverter reading timestamp if provided, otherwise current UTC
+    save_ts = reading_ts if reading_ts else now
+
+    # Deduplicate per cycle: only one weather save per minute
+    cycle_key = save_ts.strftime("%Y%m%d%H%M") if save_ts else None
+    if cycle_key == _last_weather_cycle:
+        return None
+
+    # Check if this is buffered/flushed data (dtm is more than 5 min in the past)
+    is_historical = (now - save_ts).total_seconds() > 300 if save_ts else False
+
+    # Cache API call: reuse response within 15 min, only call API when cache expires
+    # For historical data: always fetch (different timestamp = different weather)
+    need_fetch = (is_historical or _cached_weather is None or _cache_time is None or
+                  (now - _cache_time).total_seconds() >= 900)
+
+    if need_fetch:
+        import aiohttp
+
+        if is_historical:
+            # Buffered data — fetch weather for the dtm time using hourly historical
+            # Convert save_ts (UTC) to IST for the API
+            save_ist = save_ts + timedelta(hours=5, minutes=30)
+            date_str = save_ist.strftime('%Y-%m-%d')
+            hour = save_ist.hour
+            url = (
+                f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat}&longitude={lon}"
+                f"&hourly=shortwave_radiation,temperature_2m,wind_speed_10m"
+                f"&start_date={date_str}&end_date={date_str}"
+                f"&timezone=Asia/Kolkata"
+            )
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status != 200:
+                            logger.error(f"Open-Meteo historical HTTP {resp.status}")
+                            return None
+                        data = await resp.json()
+
+                hourly = data.get("hourly", {})
+                times = hourly.get("time", [])
+                ghi_list = hourly.get("shortwave_radiation", [])
+                temp_list = hourly.get("temperature_2m", [])
+                wind_list = hourly.get("wind_speed_10m", [])
+
+                # Find the closest hour
+                irradiance = ghi_list[hour] if hour < len(ghi_list) else 0
+                temperature = temp_list[hour] if hour < len(temp_list) else 30.0
+                wind_speed = wind_list[hour] if hour < len(wind_list) else 0
+                if wind_speed is not None:
+                    wind_speed = wind_speed / 3.6
+
+                logger.info(f"[WEATHER] Historical fetch for {save_ist.strftime('%H:%M')} IST: GHI={irradiance}")
+
+            except Exception as e:
+                logger.error(f"Weather historical fetch failed: {e}")
+                return None
+        else:
+            # Real-time — fetch current weather
+            url = (
+                f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat}&longitude={lon}"
+                f"&current=shortwave_radiation,temperature_2m,wind_speed_10m"
+                f"&timezone=auto"
+            )
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status != 200:
+                            logger.error(f"Open-Meteo HTTP {resp.status}")
+                            return None
+                        data = await resp.json()
+
+                current = data.get("current", {})
+                irradiance = current.get("shortwave_radiation")
+                temperature = current.get("temperature_2m")
+                wind_speed = current.get("wind_speed_10m")
+
+            except Exception as e:
+                logger.error(f"Weather fetch failed: {e}")
+                return None
+
+        if irradiance is None:
+            logger.warning("Open-Meteo returned no irradiance")
+            return None
+
+        if wind_speed is not None and isinstance(wind_speed, (int, float)) and wind_speed > 10:
+            wind_speed = wind_speed / 3.6  # km/h → m/s
+
+        _cached_weather = {"irradiance": irradiance, "temperature": temperature, "wind_speed": wind_speed}
+        _cache_time = now
+        logger.info(f"[WEATHER] API refresh: GHI={irradiance} W/m²")
+
+    irradiance = _cached_weather["irradiance"]
+    temperature = _cached_weather["temperature"]
+    wind_speed = _cached_weather["wind_speed"]
+
+    try:
+        pool = await get_pool()
+        sql = """
+            INSERT INTO weather_readings (id, "plantId", timestamp, irradiance, "ambientTemperature", "windSpeed")
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
+            RETURNING id
+        """
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(sql, plant_id, save_ts, irradiance, temperature, wind_speed)
+
+        _last_weather_cycle = cycle_key
+        logger.info(
+            f"[WEATHER] plant={plant_id[:8]} | "
+            f"GHI={irradiance:.0f} W/m² | Temp={temperature:.1f}°C | Wind={wind_speed:.1f} m/s"
+        )
+        return str(row["id"])
+
+    except Exception as e:
+        logger.error(f"Weather fetch failed: {e}")
+        return None
+
+
+async def save_inverter_log(kind: str, gateway_imei: str, topic: str,
+                            uid, sid, dtm, seq, data: Dict) -> Optional[str]:
+    """
+    Insert one modbus entry into either inverter_full_log or inverter_realtime_log.
+
+    kind: 'full' or 'realtime' — selects the table.
+    data: the modbus[i] dict (gateway register fields, JSONB).
+    """
+    table = "inverter_full_log" if kind == "full" else "inverter_realtime_log"
+
+    pool = await get_pool()
+    ts = _parse_dtm(dtm)
+
+    sql = f"""
+        INSERT INTO {table} (gateway_imei, uid, sid, dtm, seq, topic, data)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+        RETURNING id
+    """
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                sql,
+                gateway_imei,
+                int(uid) if uid is not None else None,
+                int(sid) if sid is not None else None,
+                ts,
+                int(seq) if seq is not None else None,
+                topic,
+                json.dumps(data),
+            )
+        return str(row["id"])
+    except Exception as e:
+        logger.error(f"DB write failed ({table}): {e}")
+        return None

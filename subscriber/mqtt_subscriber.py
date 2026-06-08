@@ -33,8 +33,8 @@ MQTT_QOS = int(os.getenv("MQTT_QOS", "1"))
 MQTT_KEEPALIVE = int(os.getenv("MQTT_KEEPALIVE", "60"))
 
 GATEWAY_TOPICS = [
-    ("iot1/+/event/#", MQTT_QOS),
-    ("iot2/+/event/#", MQTT_QOS),
+    ("iot1/#", MQTT_QOS),
+    ("iot2/#", MQTT_QOS),
 ]
 
 SIMULATOR_TOPICS = [
