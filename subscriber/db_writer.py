@@ -200,8 +200,7 @@ def _parse_dtm(dtm: str) -> Optional[datetime]:
         return None
     try:
         dt = datetime.strptime(str(dtm)[:14], "%Y%m%d%H%M%S")
-        dt = pytz.utc.localize(dt)
-        return dt.astimezone(IST)
+        return IST.localize(dt)  # dtm is IST — localize directly
     except ValueError:
         return None
 
