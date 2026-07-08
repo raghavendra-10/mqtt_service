@@ -20,7 +20,8 @@ from .db_writer import (
     save_mqtt_message,
     save_inverter_log,
     save_production_reading,
-    fetch_and_save_weather,
+    save_sensor_weather_reading,
+    fetch_wind_and_update,
 )
 
 logger = logging.getLogger("event_handler")
@@ -42,10 +43,13 @@ def _load_device_registry() -> Dict:
 
 _DEVICE_REGISTRY = _load_device_registry()
 
-# Plant coordinates for weather fetching
+# Plant coordinates for Open-Meteo fallback (used when physical sensor is not live)
 _PLANT_COORDS = {
     "4e830dca-ee75-46eb-9799-8ce5cbb573ce": {"lat": 9.4729, "lon": 77.7047},  # Sivakasi
 }
+
+# Latest temperature from gateway sensor (SID 1), used to override Open-Meteo temperature
+_gateway_temperature: Optional[float] = None
 
 
 class EventHandler:
@@ -68,9 +72,8 @@ class EventHandler:
             "simulator_messages": 0,
             "errors": 0,
         }
-        # Track flushed data ranges for recalculation
-        self._flush_ranges = {}  # inverter_id -> (min_ts, max_ts)
-        self._flush_last_trigger = None
+        # Flush recalculation removed: pr_scheduler.py detects gaps automatically
+        # via its 1-minute gap-check query and recalculates without any intervention.
 
     def _get_loop(self):
         if self.loop is None or self.loop.is_closed():
@@ -79,62 +82,6 @@ class EventHandler:
 
     def _run_async(self, coro):
         return self._get_loop().run_until_complete(coro)
-
-    def _track_flush(self, inverter_id: str, reading_ts):
-        """Track flushed data timestamp range per inverter."""
-        if inverter_id not in self._flush_ranges:
-            self._flush_ranges[inverter_id] = (reading_ts, reading_ts)
-        else:
-            min_ts, max_ts = self._flush_ranges[inverter_id]
-            self._flush_ranges[inverter_id] = (min(min_ts, reading_ts), max(max_ts, reading_ts))
-
-        # Trigger recalculation every 60 seconds (batch the flushes)
-        from datetime import datetime
-        now = datetime.utcnow()
-        if self._flush_last_trigger is None or (now - self._flush_last_trigger).total_seconds() > 60:
-            self._flush_last_trigger = now
-            self._trigger_recalculation()
-
-    def _trigger_recalculation(self):
-        """Delete and recalculate yield/PR for flushed data ranges."""
-        if not self._flush_ranges:
-            return
-
-        from .db_writer import get_pool
-        import json
-
-        async def _recalc():
-            pool = await get_pool()
-            for inv_id, (min_ts, max_ts) in self._flush_ranges.items():
-                min_str = min_ts.strftime('%Y-%m-%d %H:%M:%S')
-                max_str = max_ts.strftime('%Y-%m-%d %H:%M:%S')
-
-                # Delete old yield curve and PR for this range
-                async with pool.acquire() as conn:
-                    del_yc = await conn.execute(
-                        'DELETE FROM inverter_yield_curve WHERE "inverterId" = $1 AND timestamp >= $2::timestamp AND timestamp <= $3::timestamp',
-                        inv_id, min_str, max_str
-                    )
-                    del_pr = await conn.execute(
-                        'DELETE FROM inverter_pr WHERE "inverterId" = $1 AND timestamp >= $2::timestamp AND timestamp <= $3::timestamp',
-                        inv_id, min_str, max_str
-                    )
-                    # Send PG NOTIFY to trigger event listener recalculation
-                    await conn.execute(
-                        "SELECT pg_notify('new_inverter_reading', $1)",
-                        json.dumps({"inverter_id": inv_id, "timestamp": max_str, "flush_recalc": True})
-                    )
-
-                logger.info(
-                    f"[FLUSH-RECALC] inv={inv_id[:8]} range={min_str} to {max_str} — deleted old calcs, triggered recalc"
-                )
-
-            self._flush_ranges.clear()
-
-        try:
-            self._run_async(_recalc())
-        except Exception as e:
-            logger.error(f"Flush recalculation failed: {e}")
 
     def handle_message(self, topic: str, payload: bytes) -> bool:
         """Main entry point - dispatches to gateway or simulator handler."""
@@ -269,7 +216,57 @@ class EventHandler:
 
                 # Also write to production inverter_readings table
                 device = _DEVICE_REGISTRY.get(imei, {}).get(str(sid))
-                if device and device.get("type") == "inverter":
+                if device and device.get("type") == "weather":
+                    # Physical weather sensor — SID 30 (temp) or SID 91 (irr + body_temp)
+                    # Save directly to weather_readings, bypasses Open-Meteo
+                    global _gateway_temperature
+                    def _first_not_none(entry, *keys):
+                        for k in keys:
+                            v = entry.get(k)
+                            if v is not None:
+                                return v
+                        return None
+
+                    raw_temp = _first_not_none(entry, "Temperature", "temperature", "AmbientTemp", "Temp")
+                    raw_irr = _first_not_none(entry, "Irradiance", "irradiance", "GHI", "Irr", "SolarIrr")
+                    raw_wind = _first_not_none(entry, "WindSpeed", "windSpeed", "Wind")
+                    raw_body_temp = _first_not_none(entry, "Body_Temperature", "BodyTemperature", "body_temperature")
+
+                    if raw_temp is not None:
+                        _gateway_temperature = float(raw_temp)
+
+                    if raw_irr is not None or raw_temp is not None:
+                        # Physical sensor present — save directly, skip Open-Meteo
+                        from .db_writer import _parse_dtm_as_utc
+                        reading_ts = _parse_dtm_as_utc(dtm)
+                        self._run_async(save_sensor_weather_reading(
+                            plant_id=device["plant_id"],
+                            reading_ts=reading_ts,
+                            sensor_id=f"sid{sid}",
+                            temperature=float(raw_temp) if raw_temp is not None else None,
+                            irradiance=float(raw_irr) if raw_irr is not None else None,
+                            wind_speed=float(raw_wind) if raw_wind is not None else None,
+                            body_temperature=float(raw_body_temp) if raw_body_temp is not None else None,
+                        ))
+                        # Fetch wind speed from Open-Meteo and update same row
+                        _coords = _PLANT_COORDS.get(device["plant_id"], {})
+                        if _coords and reading_ts:
+                            import datetime as _dt_mod
+                            _save_ts = reading_ts.replace(second=0, microsecond=0)
+                            self._run_async(fetch_wind_and_update(
+                                plant_id=device["plant_id"],
+                                lat=_coords["lat"],
+                                lon=_coords["lon"],
+                                save_ts=_save_ts,
+                            ))
+                        logger.info(
+                            f"[SENSOR] sid={sid} temp={raw_temp}°C irr={raw_irr} W/m² body_temp={raw_body_temp}°C"
+                        )
+                    else:
+                        logger.warning(f"[SENSOR] sid={sid} — no temperature or irradiance fields in payload")
+                elif device and device.get("type") == "inverter" and device.get("active", True) is False:
+                    logger.debug(f"[SKIP] sid={sid} sn={device.get('inverter_sn')} — marked inactive in device_registry")
+                elif device and device.get("type") == "inverter":
                     prod_id = self._run_async(save_production_reading(
                         inverter_id=device["inverter_id"],
                         inverter_sn=device["inverter_sn"],
@@ -283,27 +280,21 @@ class EventHandler:
                             f"[PROD] sid={sid} sn={device['inverter_sn']} -> id={prod_id}"
                         )
 
-                        # Event-driven weather: fetch from Open-Meteo, save with inverter timestamp
-                        plant_coords = _PLANT_COORDS.get(device["plant_id"])
-                        if plant_coords:
-                            from .db_writer import _parse_dtm_as_utc
-                            reading_ts = _parse_dtm_as_utc(dtm)
-                            self._run_async(fetch_and_save_weather(
-                                plant_id=device["plant_id"],
-                                lat=plant_coords["lat"],
-                                lon=plant_coords["lon"],
-                                reading_ts=reading_ts,
-                            ))
+                        # Weather is now provided by physical sensors (SID 30 = temp, SID 91 = irradiance).
+                        # Open-Meteo is disabled — sensor data is ground truth.
+                        from .db_writer import _parse_dtm_as_utc
+                        reading_ts = _parse_dtm_as_utc(dtm)
 
-                        # Detect flushed/buffered data (dtm > 5 min behind current time)
-                        # Flag for recalculation so yield/PR gets computed for old timestamps
+                        # Flushed/buffered data is handled automatically:
+                        # pr_scheduler.py runs every 1 minute and detects any readings
+                        # in inverter_readings that have no matching inverter_pr record,
+                        # regardless of how old the timestamp is (looks back 7 days).
                         if reading_ts:
                             from datetime import datetime as _dt
                             delay_sec = (_dt.utcnow() - reading_ts).total_seconds()
-                            if delay_sec > 300:  # More than 5 min old = flushed data
-                                self._track_flush(device["inverter_id"], reading_ts)
+                            if delay_sec > 300:
                                 logger.info(
-                                    f"[FLUSH] sid={sid} dtm={dtm} delay={int(delay_sec)}s — queued for recalculation"
+                                    f"[FLUSH] sid={sid} dtm={dtm} delay={int(delay_sec)}s — will be picked up by pr_scheduler gap detection"
                                 )
                     else:
                         self.stats["errors"] += 1

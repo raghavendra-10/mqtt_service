@@ -2,11 +2,11 @@
   "_comment": "Maps WT410M gateway IMEI → plant/inverter. SID = Modbus slave ID from datalogger.",
 
   "860710086613836": {
-    "_name": "Sivakasi Plant - Gateway 1 (Inverters at SIDs 1-6)",
+    "_name": "Sivakasi Plant - Production Gateway",
     "1": {
       "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
-      "inverter_id": "9abe5cda-5009-4c32-8bf1-388daa76f876",
-      "inverter_sn": "17",
+      "inverter_id": "42de11b3-f6ea-4346-9392-222251574d17",
+      "inverter_sn": "1",
       "type": "inverter"
     },
     "2": {
@@ -38,11 +38,7 @@
       "inverter_id": "c0c4b02d-1bb7-4960-b648-135bbdc54b72",
       "inverter_sn": "6",
       "type": "inverter"
-    }
-  },
-
-  "860710086614594": {
-    "_name": "Sivakasi Plant - Gateway 2 (Inverters at SIDs 7,8,9,16,17) + Weather Sensor SID 30",
+    },
     "7": {
       "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
       "inverter_id": "f71493d2-ca0d-478a-bb07-6b258f6c8658",
@@ -61,32 +57,6 @@
       "inverter_sn": "9",
       "type": "inverter"
     },
-    "16": {
-      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
-      "inverter_id": "5c151f36-ddb9-416b-af58-a87d543ac040",
-      "inverter_sn": "16",
-      "type": "inverter"
-    },
-    "17": {
-      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
-      "inverter_id": "42de11b3-f6ea-4346-9392-222251574d17",
-      "inverter_sn": "1",
-      "type": "inverter"
-    },
-    "30": {
-      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
-      "type": "weather",
-      "_note": "SID 30 = ambient temperature sensor"
-    },
-    "91": {
-      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
-      "type": "weather",
-      "_note": "SID 91 = irradiance + body temperature sensor (Body_Temperature is debug-only)"
-    }
-  },
-
-  "860710086590992": {
-    "_name": "Sivakasi Plant - Gateway 3 (Inverters at SIDs 10-15)",
     "10": {
       "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
       "inverter_id": "a7758cd5-88f2-4aa3-b9af-a05eb63047c2",
@@ -121,6 +91,18 @@
       "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
       "inverter_id": "83102100-f3f4-4808-86fd-0487550c860d",
       "inverter_sn": "15",
+      "type": "inverter"
+    },
+    "16": {
+      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
+      "inverter_id": "5c151f36-ddb9-416b-af58-a87d543ac040",
+      "inverter_sn": "16",
+      "type": "inverter"
+    },
+    "17": {
+      "plant_id": "4e830dca-ee75-46eb-9799-8ce5cbb573ce",
+      "inverter_id": "e78cae81-9205-48cf-92f5-204249522095",
+      "inverter_sn": "17",
       "type": "inverter"
     }
   },

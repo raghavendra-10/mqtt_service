@@ -497,7 +497,7 @@ class WT410MParser:
             slave_key = str(slave_id)
             device = devices.get(slave_key)
 
-            if device and isinstance(device, dict) and "type" in device:
+            if device and isinstance(device, dict) and "type" in device and device.get("active", True) is not False:
                 results.append((
                     device["plant_id"],
                     device.get("inverter_id", ""),
@@ -506,6 +506,10 @@ class WT410MParser:
                     device["type"],
                     data,
                 ))
+            elif device and isinstance(device, dict) and device.get("active", True) is False:
+                logger.debug(
+                    f"[SKIP] gateway {gateway_uid} slave {slave_id} sn={device.get('inverter_sn')} — marked inactive"
+                )
             else:
                 logger.warning(
                     f"No mapping for gateway {gateway_uid} slave {slave_id}. "
