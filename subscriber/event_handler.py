@@ -21,7 +21,7 @@ from .db_writer import (
     save_inverter_log,
     save_production_reading,
     save_sensor_weather_reading,
-    fetch_wind_and_update,
+    fetch_openmeteo_and_update,
 )
 
 logger = logging.getLogger("event_handler")
@@ -248,12 +248,12 @@ class EventHandler:
                             wind_speed=float(raw_wind) if raw_wind is not None else None,
                             body_temperature=float(raw_body_temp) if raw_body_temp is not None else None,
                         ))
-                        # Fetch wind speed from Open-Meteo and update same row
+                        # Fetch wind speed + ambient temperature from Open-Meteo and update same row
                         _coords = _PLANT_COORDS.get(device["plant_id"], {})
                         if _coords and reading_ts:
                             import datetime as _dt_mod
                             _save_ts = reading_ts.replace(second=0, microsecond=0)
-                            self._run_async(fetch_wind_and_update(
+                            self._run_async(fetch_openmeteo_and_update(
                                 plant_id=device["plant_id"],
                                 lat=_coords["lat"],
                                 lon=_coords["lon"],

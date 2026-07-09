@@ -321,10 +321,11 @@ _last_sensor_ts: Optional[datetime] = None
 # Allows SID 30 (temp) and SID 91 (irr) to each save once per minute independently
 _sensor_cycles: Dict[str, str] = {}
 
-# Wind cache: reuse Open-Meteo wind response for 15 minutes
+# Open-Meteo cache: reuse wind + ambient temperature response for 15 minutes
 _wind_cache: Optional[float] = None
 _wind_cache_time: Optional[datetime] = None
-_wind_cache_minute: Optional[str] = None  # cycle_key of last wind update
+_wind_cache_minute: Optional[str] = None  # cycle_key of last update
+_openmeteo_temp_cache: Optional[float] = None
 
 
 async def save_sensor_weather_reading(plant_id: str, reading_ts: Optional[datetime],
@@ -334,8 +335,12 @@ async def save_sensor_weather_reading(plant_id: str, reading_ts: Optional[dateti
                                        wind_speed: Optional[float] = None,
                                        body_temperature: Optional[float] = None) -> Optional[str]:
     """
-    Save weather data from a physical on-site sensor directly to weather_readings.
-    Bypasses Open-Meteo entirely — sensor data is ground truth.
+    Save weather data from a physical on-site (datalogger) sensor to weather_readings.
+    `temperature` (SID 30 gateway reading) is ground truth for the module-area
+    sensor and is stored in moduleTemperature — it runs hot in direct sun
+    (60-70C) and is NOT true ambient air temperature. ambientTemperature is
+    owned by the Open-Meteo follow-up call (fetch_openmeteo_and_update) and is
+    never overwritten here — a placeholder is inserted only if the row is new.
     Deduplicates per minute per sensor (SID 30 and SID 91 each save independently).
     """
     global _last_sensor_ts, _sensor_cycles
@@ -358,14 +363,14 @@ async def save_sensor_weather_reading(plant_id: str, reading_ts: Optional[dateti
             row = await conn.fetchrow(
                 """
                 INSERT INTO weather_readings
-                    (id, "plantId", timestamp, irradiance, "ambientTemperature", "windSpeed", "bodyTemperature")
-                VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
+                    (id, "plantId", timestamp, irradiance, "ambientTemperature", "moduleTemperature", "windSpeed", "bodyTemperature")
+                VALUES (gen_random_uuid(), $1, $2, $3, 0.0, $4, $5, $6)
                 ON CONFLICT ("plantId", timestamp)
                 DO UPDATE SET
-                    irradiance           = GREATEST(EXCLUDED.irradiance,           weather_readings.irradiance),
-                    "ambientTemperature" = GREATEST(EXCLUDED."ambientTemperature", weather_readings."ambientTemperature"),
-                    "windSpeed"          = COALESCE(EXCLUDED."windSpeed",          weather_readings."windSpeed"),
-                    "bodyTemperature"    = COALESCE(EXCLUDED."bodyTemperature",    weather_readings."bodyTemperature")
+                    irradiance          = GREATEST(EXCLUDED.irradiance,          weather_readings.irradiance),
+                    "moduleTemperature" = GREATEST(EXCLUDED."moduleTemperature", weather_readings."moduleTemperature"),
+                    "windSpeed"         = COALESCE(EXCLUDED."windSpeed",         weather_readings."windSpeed"),
+                    "bodyTemperature"   = COALESCE(EXCLUDED."bodyTemperature",   weather_readings."bodyTemperature")
                 RETURNING id
                 """,
                 plant_id,
@@ -379,7 +384,7 @@ async def save_sensor_weather_reading(plant_id: str, reading_ts: Optional[dateti
         _last_sensor_ts = now
         logger.info(
             f"[SENSOR] plant={plant_id[:8]} | sensor={sensor_id} | "
-            f"GHI={irradiance} W/m² | Temp={temperature}°C | BodyTemp={body_temperature}°C [physical sensor]"
+            f"GHI={irradiance} W/m² | ModuleTemp={temperature}°C | BodyTemp={body_temperature}°C [physical sensor]"
         )
         return str(row["id"])
     except Exception as e:
@@ -387,14 +392,18 @@ async def save_sensor_weather_reading(plant_id: str, reading_ts: Optional[dateti
         return None
 
 
-async def fetch_wind_and_update(plant_id: str, lat: float, lon: float, save_ts: datetime) -> None:
+async def fetch_openmeteo_and_update(plant_id: str, lat: float, lon: float, save_ts: datetime) -> None:
     """
-    Fetch wind speed from Open-Meteo and UPDATE the existing weather_readings row
-    for this plant+minute with the windSpeed value.
-    Called after save_sensor_weather_reading so irradiance/temp stay from physical sensors.
+    Fetch wind speed + ambient temperature from Open-Meteo and UPDATE the
+    existing weather_readings row for this plant+minute.
+    Called after save_sensor_weather_reading. ambientTemperature is owned
+    exclusively by this function — the datalogger's own temperature reading
+    goes to moduleTemperature instead (it runs hot in direct sun, not
+    representative of true air temperature).
     Cached for 15 minutes — only one API call per 15-min window.
     """
     global _wind_cache, _wind_cache_time, _wind_cache_minute
+    global _openmeteo_temp_cache
 
     now = datetime.utcnow()
     cycle_key = save_ts.strftime("%Y%m%d%H%M")
@@ -403,7 +412,7 @@ async def fetch_wind_and_update(plant_id: str, lat: float, lon: float, save_ts: 
     if _wind_cache_minute == cycle_key:
         return
 
-    # Reuse cached wind value if within 15 minutes
+    # Reuse cached values if within 15 minutes
     need_fetch = (
         _wind_cache is None or
         _wind_cache_time is None or
@@ -416,31 +425,37 @@ async def fetch_wind_and_update(plant_id: str, lat: float, lon: float, save_ts: 
             url = (
                 f"https://api.open-meteo.com/v1/forecast"
                 f"?latitude={lat}&longitude={lon}"
-                f"&current=wind_speed_10m"
+                f"&current=wind_speed_10m,temperature_2m"
                 f"&timezone=auto"
             )
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status != 200:
-                        logger.warning(f"[WIND] Open-Meteo HTTP {resp.status}")
+                        logger.warning(f"[WEATHER-API] Open-Meteo HTTP {resp.status}")
                         return
                     data = await resp.json()
 
-            raw_wind = data.get("current", {}).get("wind_speed_10m")
-            if raw_wind is None:
-                logger.warning("[WIND] Open-Meteo returned no wind speed")
+            current = data.get("current", {})
+            raw_wind = current.get("wind_speed_10m")
+            raw_temp = current.get("temperature_2m")
+            if raw_wind is None and raw_temp is None:
+                logger.warning("[WEATHER-API] Open-Meteo returned no wind/temperature")
                 return
 
             # Open-Meteo returns km/h → convert to m/s
-            _wind_cache = round(float(raw_wind) / 3.6, 2)
+            if raw_wind is not None:
+                _wind_cache = round(float(raw_wind) / 3.6, 2)
+            if raw_temp is not None:
+                _openmeteo_temp_cache = round(float(raw_temp), 2)
             _wind_cache_time = now
-            logger.info(f"[WIND] API refresh: {raw_wind} km/h → {_wind_cache} m/s")
+            logger.info(f"[WEATHER-API] refresh: wind={raw_wind} km/h → {_wind_cache} m/s, temp={_openmeteo_temp_cache}°C")
 
         except Exception as e:
-            logger.error(f"[WIND] Fetch failed: {e}")
+            logger.error(f"[WEATHER-API] Fetch failed: {e}")
             return
 
     wind_speed = _wind_cache
+    ambient_temp = _openmeteo_temp_cache
 
     try:
         pool = await get_pool()
@@ -448,15 +463,16 @@ async def fetch_wind_and_update(plant_id: str, lat: float, lon: float, save_ts: 
             await conn.execute(
                 """
                 UPDATE weather_readings
-                SET "windSpeed" = $1
-                WHERE "plantId" = $2 AND timestamp = $3
+                SET "windSpeed" = COALESCE($1, "windSpeed"),
+                    "ambientTemperature" = COALESCE($2, "ambientTemperature")
+                WHERE "plantId" = $3 AND timestamp = $4
                 """,
-                wind_speed, plant_id, save_ts,
+                wind_speed, ambient_temp, plant_id, save_ts,
             )
         _wind_cache_minute = cycle_key
-        logger.info(f"[WIND] Updated plantId={plant_id[:8]} ts={save_ts} wind={wind_speed} m/s")
+        logger.info(f"[WEATHER-API] Updated plantId={plant_id[:8]} ts={save_ts} wind={wind_speed} m/s ambientTemp={ambient_temp}°C")
     except Exception as e:
-        logger.error(f"[WIND] DB update failed: {e}")
+        logger.error(f"[WEATHER-API] DB update failed: {e}")
 
 
 async def fetch_and_save_weather(plant_id: str, lat: float, lon: float,
