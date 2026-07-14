@@ -248,9 +248,10 @@ async def save_production_reading(inverter_id: str, inverter_sn: str,
         "frequency": val("Gridfreq", 1.0, "Grid frequency"),               # Hz
         "powerFactor": val("PowFactor", 1.0, "Power factor"),               # 0-1
         "faultId": int(data.get("FalCode", data.get("Fault Code", 0)) or 0),
-        # Active power ratio / power-limit setpoint (%). Sungrow "PowLimitSet".
-        # Not sent by all OEMs — stays None when absent.
-        "activePowerRatio": val("PowLimitSet", 1.0, "Active power ratio"),
+        # Active power ratio (%) — Sungrow named field "ActPowRatio" (values
+        # already in %, e.g. 95/100). Falls back to "PowLimitSet" for OEMs that
+        # use that label. Stays None when the OEM sends neither.
+        "activePowerRatio": val("ActPowRatio", 1.0, "PowLimitSet"),
         # AC voltages (V)
         "ryAcVolt": val("ABlineVol", 1.0, "A-B line voltage/p"),
         "ybAcVolt": val("BClineVol", 1.0, "B-C line Voltage/p"),
