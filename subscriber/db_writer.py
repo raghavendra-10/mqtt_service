@@ -353,20 +353,31 @@ async def save_production_reading(inverter_id: str, inverter_sn: str,
         async with pool.acquire() as conn:
             # Recognise the OEM from the payload id and sync it onto the inverter
             # once per process (idempotent no-op when already correct).
-            oem_id_raw = data.get("oem")
-            if oem_id_raw is not None and inverter_id not in _oem_synced:
-                try:
-                    oem_id = int(oem_id_raw)
-                    name = await _resolve_oem_name(conn, oem_id)
-                    if name:
-                        await conn.execute(
-                            'UPDATE inverters SET "oem"=$1, "oemId"=$2 WHERE id=$3 '
-                            'AND ("oem" IS DISTINCT FROM $1 OR "oemId" IS DISTINCT FROM $2)',
-                            name, oem_id, inverter_id,
-                        )
-                    _oem_synced.add(inverter_id)
-                except (ValueError, TypeError):
-                    pass
+            if inverter_id not in _oem_synced:
+                oem_id, name = None, None
+                oem_id_raw = data.get("oem")
+                if oem_id_raw is not None:
+                    try:
+                        oem_id = int(oem_id_raw)
+                        name = await _resolve_oem_name(conn, oem_id)
+                    except (ValueError, TypeError):
+                        oem_id = None
+                if name:
+                    # Known OEM → set it (only writes when actually different).
+                    await conn.execute(
+                        'UPDATE inverters SET "oem"=$1, "oemId"=$2 WHERE id=$3 '
+                        'AND ("oem" IS DISTINCT FROM $1 OR "oemId" IS DISTINCT FROM $2)',
+                        name, oem_id, inverter_id,
+                    )
+                else:
+                    # Missing/unknown OEM id → fall back to Sungrow, but ONLY when the
+                    # inverter has no resolved OEM yet (never downgrade a known OEM).
+                    await conn.execute(
+                        'UPDATE inverters SET "oem"=\'Sungrow\', "oemId"=1 '
+                        'WHERE id=$1 AND "oemId" IS NULL',
+                        inverter_id,
+                    )
+                _oem_synced.add(inverter_id)
 
             row = await conn.fetchrow(sql, *vals)
         return str(row["id"])
