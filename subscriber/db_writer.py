@@ -205,6 +205,31 @@ def _parse_dtm(dtm: str) -> Optional[datetime]:
         return None
 
 
+# --- OEM lookup (payload `oem` id -> name) ------------------------------------
+# Cached from the `oem` table; each inverter's OEM is synced once per process.
+_oem_cache: Optional[Dict[int, str]] = None
+_oem_synced = set()
+# Solis bit-packed fault registers captured into inverter_readings.faultBits.
+SOLIS_FAULT_FIELDS = (
+    "Fault01", "Fault02", "Fault03", "Fault04", "Fault05", "Fault06",
+    "Fault07", "Fault08", "Fault10", "Fault11", "Fault12",
+    "LimitStat", "WarnDSP", "WarnHMI",
+)
+
+
+async def _resolve_oem_name(conn, oem_id: int) -> Optional[str]:
+    """Resolve a payload OEM id to its name via the cached `oem` lookup table."""
+    global _oem_cache
+    if _oem_cache is None:
+        try:
+            rows = await conn.fetch("SELECT id, name FROM oem")
+            _oem_cache = {r["id"]: r["name"] for r in rows}
+        except Exception as e:
+            logger.warning(f"OEM lookup unavailable: {e}")
+            _oem_cache = {}
+    return _oem_cache.get(oem_id)
+
+
 async def save_production_reading(inverter_id: str, inverter_sn: str,
                                   dtm: str, data: Dict, sid: int = None) -> Optional[str]:
     """
@@ -281,20 +306,41 @@ async def save_production_reading(inverter_id: str, inverter_sn: str,
         if c is not None:
             reading[f"pv{i}Current"] = c
 
-    # Build dynamic INSERT — only include non-None fields
+    # Solis bit-packed fault registers → faultBits JSONB. Only non-zero registers
+    # are stored, so Sungrow readings (which use faultId) never get a faultBits value.
+    fault_bits = {}
+    for fld in SOLIS_FAULT_FIELDS:
+        raw = data.get(fld)
+        if raw is None:
+            continue
+        try:
+            iv = int(raw)
+        except (ValueError, TypeError):
+            continue
+        if iv != 0:
+            fault_bits[fld] = iv
+    if fault_bits:
+        reading["faultBits"] = json.dumps(fault_bits)
+
+    # Build dynamic INSERT — only include non-None fields. faultBits needs a
+    # ::jsonb cast since it is passed as a JSON string.
+    JSONB_COLS = {"faultBits"}
     cols = ['"inverterId"', '"inverterSn"', '"timestamp"']
     vals = [inverter_id, inverter_sn, ts]
+    casts = ['', '', '']
 
     if sid is not None:
         cols.append('sid')
         vals.append(sid)
+        casts.append('')
 
     for col, v in reading.items():
         if v is not None:
             cols.append(f'"{col}"')
             vals.append(v)
+            casts.append('::jsonb' if col in JSONB_COLS else '')
 
-    placeholders = ", ".join(f"${i+1}" for i in range(len(vals)))
+    placeholders = ", ".join(f"${i+1}{casts[i]}" for i in range(len(vals)))
     col_list = ", ".join(cols)
 
     sql = f"""
@@ -305,6 +351,23 @@ async def save_production_reading(inverter_id: str, inverter_sn: str,
 
     try:
         async with pool.acquire() as conn:
+            # Recognise the OEM from the payload id and sync it onto the inverter
+            # once per process (idempotent no-op when already correct).
+            oem_id_raw = data.get("oem")
+            if oem_id_raw is not None and inverter_id not in _oem_synced:
+                try:
+                    oem_id = int(oem_id_raw)
+                    name = await _resolve_oem_name(conn, oem_id)
+                    if name:
+                        await conn.execute(
+                            'UPDATE inverters SET "oem"=$1, "oemId"=$2 WHERE id=$3 '
+                            'AND ("oem" IS DISTINCT FROM $1 OR "oemId" IS DISTINCT FROM $2)',
+                            name, oem_id, inverter_id,
+                        )
+                    _oem_synced.add(inverter_id)
+                except (ValueError, TypeError):
+                    pass
+
             row = await conn.fetchrow(sql, *vals)
         return str(row["id"])
     except Exception as e:
