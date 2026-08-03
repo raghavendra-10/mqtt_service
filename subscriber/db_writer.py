@@ -355,7 +355,9 @@ async def save_production_reading(inverter_id: str, inverter_sn: str,
             # once per process (idempotent no-op when already correct).
             if inverter_id not in _oem_synced:
                 oem_id, name = None, None
-                oem_id_raw = data.get("oem")
+                # Gateway payload carries the OEM id as `oemId` (per modbus entry);
+                # accept legacy `oem` too.
+                oem_id_raw = data.get("oemId", data.get("oem"))
                 if oem_id_raw is not None:
                     try:
                         oem_id = int(oem_id_raw)

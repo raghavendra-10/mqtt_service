@@ -149,6 +149,12 @@ class EventHandler:
             #    meaningless and often contain control characters that break JSON parsing.
             text = re.sub(r'"reserved\d*"\s*:\s*"[^"]*"', '"_reserved":""', text)
 
+            # 1b. Gateway firmware emits the OEM id as an UNQUOTED key, e.g.
+            #     `{ oemId:1,"sid":...}`. That is invalid JSON and was causing the
+            #     entire payload (whole inverter reading) to be dropped. Quote the
+            #     key so it parses; the value is read downstream as the OEM id.
+            text = re.sub(r'([{,]\s*)oemId(\s*:)', r'\1"oemId"\2', text)
+
             # 2. Try parsing — use strict=False to tolerate any remaining control chars
             try:
                 data = json.loads(text, strict=False)
