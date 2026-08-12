@@ -20,6 +20,8 @@ import asyncpg
 import pytz
 from dotenv import load_dotenv
 
+from . import dev_mirror  # best-effort dev-DB mirror (no-op unless DEV_DATABASE_URL set)
+
 load_dotenv()
 
 logger = logging.getLogger("db_writer")
@@ -382,6 +384,14 @@ async def save_production_reading(inverter_id: str, inverter_sn: str,
                 _oem_synced.add(inverter_id)
 
             row = await conn.fetchrow(sql, *vals)
+        # Best-effort mirror into the dev DB (fire-and-forget; no-op unless
+        # DEV_DATABASE_URL is set). Same id + ON CONFLICT so dev stays in parity
+        # and re-processing can't duplicate. Never affects the prod path above.
+        if dev_mirror.enabled():
+            dev_ph = ", ".join(f"${i+2}{casts[i]}" for i in range(len(vals)))
+            dev_sql = (f"INSERT INTO inverter_readings (id, {col_list}) "
+                       f"VALUES ($1, {dev_ph}) ON CONFLICT (id) DO NOTHING")
+            dev_mirror.mirror(dev_sql, (row["id"], *vals))
         return str(row["id"])
     except Exception as e:
         logger.error(f"Production write failed: {e}")
@@ -462,6 +472,25 @@ async def save_sensor_weather_reading(plant_id: str, reading_ts: Optional[dateti
             )
         _sensor_cycles[dedup_key] = cycle_key
         _last_sensor_ts = now
+        # Best-effort mirror to dev (fire-and-forget; idempotent on plantId+timestamp).
+        if dev_mirror.enabled():
+            dev_mirror.mirror(
+                """
+                INSERT INTO weather_readings
+                    (id, "plantId", timestamp, irradiance, "ambientTemperature", "moduleTemperature", "windSpeed", "bodyTemperature")
+                VALUES (gen_random_uuid(), $1, $2, $3, 0.0, $4, $5, $6)
+                ON CONFLICT ("plantId", timestamp) DO UPDATE SET
+                    irradiance          = GREATEST(EXCLUDED.irradiance,          weather_readings.irradiance),
+                    "moduleTemperature" = GREATEST(EXCLUDED."moduleTemperature", weather_readings."moduleTemperature"),
+                    "windSpeed"         = COALESCE(EXCLUDED."windSpeed",         weather_readings."windSpeed"),
+                    "bodyTemperature"   = COALESCE(EXCLUDED."bodyTemperature",   weather_readings."bodyTemperature")
+                """,
+                (plant_id, save_ts,
+                 float(irradiance) if irradiance is not None else 0.0,
+                 float(temperature) if temperature is not None else 0.0,
+                 float(wind_speed) if wind_speed is not None else None,
+                 float(body_temperature) if body_temperature is not None else None),
+            )
         logger.info(
             f"[SENSOR] plant={plant_id[:8]} | sensor={sensor_id} | "
             f"GHI={irradiance} W/m² | ModuleTemp={temperature}°C | BodyTemp={body_temperature}°C [physical sensor]"
