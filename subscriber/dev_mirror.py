@@ -22,8 +22,14 @@ import asyncpg
 
 logger = logging.getLogger("dev_mirror")
 
-DEV_DATABASE_URL = os.getenv("DEV_DATABASE_URL", "").strip()
 MAX_INFLIGHT = int(os.getenv("DEV_MIRROR_MAX_INFLIGHT", "50"))
+
+
+def _dev_url() -> str:
+    # Read lazily (at call time), NOT at import — db_writer imports this module
+    # BEFORE it calls load_dotenv(), so reading at import would miss the value.
+    return os.getenv("DEV_DATABASE_URL", "").strip()
+
 
 _dev_pool: Optional[asyncpg.Pool] = None
 _inflight = 0
@@ -35,13 +41,16 @@ _tasks: set = set()
 
 
 def enabled() -> bool:
-    return bool(DEV_DATABASE_URL)
+    return bool(_dev_url())
 
 
 async def _get_dev_pool() -> asyncpg.Pool:
     global _dev_pool
     if _dev_pool is None or _dev_pool._closed:
-        dsn = DEV_DATABASE_URL.replace("?schema=public", "")
+        # Strip the ENTIRE query string — the URL may carry Prisma-only params
+        # (?schema=public&connection_limit=20&pool_timeout=30) that asyncpg/libpq
+        # don't understand (they'd get parsed into the db name). SSL is set below.
+        dsn = _dev_url().split("?", 1)[0]
         # short command timeout so a hung dev DB can't tie up a task for long.
         # ssl='prefer' works for RDS (uses TLS when offered, no cert pinning).
         _dev_pool = await asyncpg.create_pool(
