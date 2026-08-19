@@ -566,19 +566,24 @@ async def fetch_openmeteo_and_update(plant_id: str, lat: float, lon: float, save
     wind_speed = _wind_cache
     ambient_temp = _openmeteo_temp_cache
 
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
+    _openmeteo_update_sql = """
                 UPDATE weather_readings
                 SET "windSpeed" = COALESCE($1, "windSpeed"),
                     "ambientTemperature" = COALESCE($2, "ambientTemperature")
                 WHERE "plantId" = $3 AND timestamp = $4
-                """,
-                wind_speed, ambient_temp, plant_id, save_ts,
-            )
+                """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(_openmeteo_update_sql, wind_speed, ambient_temp, plant_id, save_ts)
         _wind_cache_minute = cycle_key
+        # Mirror the Open-Meteo ambient-temperature + wind UPDATE to the dev DB
+        # (best-effort). Without this, dev's weather rows keep ambientTemperature=0
+        # and windSpeed=NULL because only the sensor INSERT (irradiance + module
+        # temp) was mirrored — the external-API UPDATE was not. The nightly
+        # reconciliation job backfills any that miss (e.g. dev row not yet present).
+        if dev_mirror.enabled():
+            dev_mirror.mirror(_openmeteo_update_sql, (wind_speed, ambient_temp, plant_id, save_ts))
         logger.info(f"[WEATHER-API] Updated plantId={plant_id[:8]} ts={save_ts} wind={wind_speed} m/s ambientTemp={ambient_temp}°C")
     except Exception as e:
         logger.error(f"[WEATHER-API] DB update failed: {e}")
